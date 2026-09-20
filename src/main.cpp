@@ -11,6 +11,8 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 
+#include "AlarmLogic.h"
+
 // ============================================================
 // PIN DEFINITIONS
 // ============================================================
@@ -798,8 +800,6 @@ void sensorTask(void *parameter)
 
     while (1)
     {
-        // DHT22
-
         float newTemperature;
         float newHumidity;
 
@@ -831,8 +831,6 @@ void sensorTask(void *parameter)
             );
         }
 
-        // LDR
-
         int raw_value = 0;
 
         result =
@@ -856,12 +854,40 @@ void sensorTask(void *parameter)
             sensorData.lightLevel
         );
 
-        // Motion not yet installed
-
         sensorData.motionDetected =
             false;
 
-        // Send data
+        // ====================================================
+        // TESTABLE ALARM DECISION LOGIC
+        // ====================================================
+
+        AlarmState alarmState =
+            evaluateTemperature(
+                sensorData.temperature
+            );
+
+        if (
+            alarmState ==
+            AlarmState::LOW_TEMPERATURE)
+        {
+            printf(
+                "Alarm State: LOW TEMPERATURE\n"
+            );
+        }
+        else if (
+            alarmState ==
+            AlarmState::HIGH_TEMPERATURE)
+        {
+            printf(
+                "Alarm State: HIGH TEMPERATURE\n"
+            );
+        }
+        else
+        {
+            printf(
+                "Alarm State: NORMAL\n"
+            );
+        }
 
         xQueueSend(
             displayQueue,
@@ -872,8 +898,6 @@ void sensorTask(void *parameter)
         printf(
             "Sensor data sent to queue\n"
         );
-
-        // Required periodic timing
 
         vTaskDelayUntil(
             &lastWakeTime,
@@ -931,30 +955,8 @@ void inputTask(void *parameter)
                     ENCODER_DT
                 );
 
-            /*
-             * IMPORTANT:
-             *
-             * This condition is reversed from
-             * the previous version to match
-             * the Wokwi encoder wiring.
-             *
-             * Clockwise:
-             *
-             * Temperature
-             *      ↓
-             * Humidity
-             *      ↓
-             * Light
-             *      ↓
-             * Motion
-             *      ↓
-             * Temperature
-             */
-
             if (currentDT == currentCLK)
             {
-                // CLOCKWISE
-
                 switch (currentMode)
                 {
                     case DisplayMode::TEMPERATURE:
@@ -984,8 +986,6 @@ void inputTask(void *parameter)
             }
             else
             {
-                // COUNTERCLOCKWISE
-
                 switch (currentMode)
                 {
                     case DisplayMode::TEMPERATURE:
@@ -1205,8 +1205,6 @@ void displayTask(void *parameter)
 
     oled_init();
 
-    // Show Temperature immediately
-
     drawDisplay(
         currentMode,
         sensorData
@@ -1216,8 +1214,6 @@ void displayTask(void *parameter)
     {
         bool displayChanged =
             false;
-
-        // Check encoder mode
 
         DisplayMode newMode;
 
@@ -1234,8 +1230,6 @@ void displayTask(void *parameter)
             displayChanged =
                 true;
         }
-
-        // Check sensor data
 
         SensorData newSensorData;
 
@@ -1283,8 +1277,6 @@ extern "C" void app_main(void)
         "System starting...\n"
     );
 
-    // DHT22
-
     gpio_set_direction(
         DHT_PIN,
         GPIO_MODE_INPUT
@@ -1293,8 +1285,6 @@ extern "C" void app_main(void)
     gpio_pullup_en(
         DHT_PIN
     );
-
-    // Create queues
 
     displayQueue =
         xQueueCreate(
@@ -1319,8 +1309,6 @@ extern "C" void app_main(void)
         return;
     }
 
-    // SensorTask
-
     xTaskCreate(
         sensorTask,
         "SensorTask",
@@ -1330,8 +1318,6 @@ extern "C" void app_main(void)
         NULL
     );
 
-    // InputTask
-
     xTaskCreate(
         inputTask,
         "InputTask",
@@ -1340,8 +1326,6 @@ extern "C" void app_main(void)
         2,
         NULL
     );
-
-    // DisplayTask
 
     xTaskCreate(
         displayTask,
