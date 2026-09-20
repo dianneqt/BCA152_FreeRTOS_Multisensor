@@ -1,8 +1,7 @@
-#include <esp_log.h>
+#include <stdio.h>
 
-const char *TAG = "MAIN";
-
-void app_main() {
-     ESP_LOGI(TAG, "BCA152 FreeRTOS Multisensor");
-     ESP_LOGI(TAG, "System Starting...");
+extern "C" void app_main(void)
+{
+    printf("BCA152 FreeRTOS Multisensor\n");
+    printf("System starting...\n");
 }
