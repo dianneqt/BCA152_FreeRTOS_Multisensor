@@ -2,7 +2,16 @@
   "version": 1,
   "author": "Princess Dianne ESTORES",
   "editor": "wokwi",
-  "parts": [ { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} } ],
-  "connections": [ [ "esp:TX", "$serialMonitor:RX", "", [] ], [ "esp:RX", "$serialMonitor:TX", "", [] ] ],
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-dht22", "id": "dht1", "top": 57.9, "left": -101.4, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "dht1:VCC", "esp:3V3", "red", [ "v28.8", "h-67.2", "v-172.8" ] ],
+    [ "dht1:SDA", "esp:4", "green", [ "v57.6", "h211.3", "v-19.2" ] ],
+    [ "dht1:GND", "esp:GND.1", "black", [ "v19.2", "h38.4", "v-38.4" ] ]
+  ],
   "dependencies": {}
 }
