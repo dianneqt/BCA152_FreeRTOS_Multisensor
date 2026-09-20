@@ -40,7 +40,7 @@ QueueHandle_t displayQueue;
 QueueHandle_t alarmQueue;
 
 // ----------------------------------------------------
-// OLED functions
+// OLED command
 // ----------------------------------------------------
 static void oled_command(uint8_t command)
 {
@@ -58,7 +58,12 @@ static void oled_command(uint8_t command)
     );
 }
 
-static void oled_data(const uint8_t *data, size_t length)
+// ----------------------------------------------------
+// OLED data
+// ----------------------------------------------------
+static void oled_data(
+    const uint8_t *data,
+    size_t length)
 {
     uint8_t buffer[129];
 
@@ -164,9 +169,14 @@ static void oled_set_cursor(int x, int page)
 // ----------------------------------------------------
 // Draw one character
 // ----------------------------------------------------
-static void oled_char(int x, int page, char c)
+static void oled_char(
+    int x,
+    int page,
+    char c)
 {
-    uint8_t pixels[6] = {0, 0, 0, 0, 0, 0};
+    uint8_t pixels[6] = {
+        0, 0, 0, 0, 0, 0
+    };
 
     switch (c)
     {
@@ -320,12 +330,28 @@ static void oled_char(int x, int page, char c)
             pixels[4] = 0x7F;
             break;
 
+        case 'N':
+            pixels[0] = 0x7F;
+            pixels[1] = 0x02;
+            pixels[2] = 0x0C;
+            pixels[3] = 0x18;
+            pixels[4] = 0x7F;
+            break;
+
         case 'P':
             pixels[0] = 0x7F;
             pixels[1] = 0x09;
             pixels[2] = 0x09;
             pixels[3] = 0x09;
             pixels[4] = 0x06;
+            break;
+
+        case 'R':
+            pixels[0] = 0x7F;
+            pixels[1] = 0x09;
+            pixels[2] = 0x19;
+            pixels[3] = 0x29;
+            pixels[4] = 0x46;
             break;
 
         case 'T':
@@ -355,6 +381,14 @@ static void oled_char(int x, int page, char c)
             pixels[4] = 0x63;
             break;
 
+        case '.':
+            pixels[0] = 0x00;
+            pixels[1] = 0x60;
+            pixels[2] = 0x60;
+            pixels[3] = 0x00;
+            pixels[4] = 0x00;
+            break;
+
         case '-':
             pixels[0] = 0x08;
             pixels[1] = 0x08;
@@ -373,9 +407,12 @@ static void oled_char(int x, int page, char c)
 }
 
 // ----------------------------------------------------
-// Draw integer number
+// Draw integer
 // ----------------------------------------------------
-static void oled_number(int x, int page, int number)
+static void oled_number(
+    int x,
+    int page,
+    int number)
 {
     if (number < 0)
     {
@@ -386,38 +423,116 @@ static void oled_number(int x, int page, int number)
 
     if (number >= 100)
     {
-        oled_char(x, page, '0' + (number / 100));
+        oled_char(
+            x,
+            page,
+            '0' + (number / 100)
+        );
+
         number %= 100;
         x += 6;
     }
 
     if (number >= 10)
     {
-        oled_char(x, page, '0' + (number / 10));
+        oled_char(
+            x,
+            page,
+            '0' + (number / 10)
+        );
+
         number %= 10;
         x += 6;
     }
 
-    oled_char(x, page, '0' + number);
+    oled_char(
+        x,
+        page,
+        '0' + number
+    );
 }
 
 // ----------------------------------------------------
-// DHT22 reading function
+// Draw one decimal temperature
+// Example: 25.4
 // ----------------------------------------------------
-static bool dht22_read(float *temperature, float *humidity)
+static void oled_temperature(
+    int x,
+    int page,
+    float temperature)
 {
-    uint8_t data[5] = {0, 0, 0, 0, 0};
+    if (temperature < 0)
+    {
+        oled_char(x, page, '-');
+        x += 6;
+        temperature = -temperature;
+    }
+
+    int whole =
+        (int)temperature;
+
+    int decimal =
+        (int)((temperature - whole) * 10.0f + 0.5f);
+
+    if (decimal >= 10)
+    {
+        whole++;
+        decimal = 0;
+    }
+
+    oled_number(
+        x,
+        page,
+        whole
+    );
+
+    if (whole < 10)
+        x += 6;
+    else if (whole < 100)
+        x += 12;
+    else
+        x += 18;
+
+    oled_char(
+        x,
+        page,
+        '.'
+    );
+
+    oled_char(
+        x + 6,
+        page,
+        '0' + decimal
+    );
+}
+
+// ----------------------------------------------------
+// DHT22 reading
+// ----------------------------------------------------
+static bool dht22_read(
+    float *temperature,
+    float *humidity)
+{
+    uint8_t data[5] = {
+        0, 0, 0, 0, 0
+    };
 
     gpio_set_direction(
         DHT_PIN,
         GPIO_MODE_OUTPUT
     );
 
-    gpio_set_level(DHT_PIN, 0);
+    gpio_set_level(
+        DHT_PIN,
+        0
+    );
 
     esp_rom_delay_us(1200);
 
-    gpio_set_level(DHT_PIN, 1);
+    gpio_set_level(
+        DHT_PIN,
+        1
+    );
 
     esp_rom_delay_us(30);
 
@@ -428,55 +543,88 @@ static bool dht22_read(float *temperature, float *humidity)
 
     gpio_pullup_en(DHT_PIN);
 
-    int64_t start = esp_timer_get_time();
+    int64_t start =
+        esp_timer_get_time();
 
-    while (gpio_get_level(DHT_PIN) == 1)
+    while (
+        gpio_get_level(DHT_PIN) == 1)
     {
-        if (esp_timer_get_time() - start > 100)
+        if (
+            esp_timer_get_time() -
+            start > 100)
+        {
             return false;
+        }
     }
 
-    start = esp_timer_get_time();
+    start =
+        esp_timer_get_time();
 
-    while (gpio_get_level(DHT_PIN) == 0)
+    while (
+        gpio_get_level(DHT_PIN) == 0)
     {
-        if (esp_timer_get_time() - start > 100)
+        if (
+            esp_timer_get_time() -
+            start > 100)
+        {
             return false;
+        }
     }
 
-    start = esp_timer_get_time();
+    start =
+        esp_timer_get_time();
 
-    while (gpio_get_level(DHT_PIN) == 1)
+    while (
+        gpio_get_level(DHT_PIN) == 1)
     {
-        if (esp_timer_get_time() - start > 100)
+        if (
+            esp_timer_get_time() -
+            start > 100)
+        {
             return false;
+        }
     }
 
     // Read 40 bits
     for (int i = 0; i < 40; i++)
     {
-        start = esp_timer_get_time();
+        start =
+            esp_timer_get_time();
 
-        while (gpio_get_level(DHT_PIN) == 0)
+        while (
+            gpio_get_level(DHT_PIN) == 0)
         {
-            if (esp_timer_get_time() - start > 100)
+            if (
+                esp_timer_get_time() -
+                start > 100)
+            {
                 return false;
+            }
         }
 
         int64_t high_start =
             esp_timer_get_time();
 
-        while (gpio_get_level(DHT_PIN) == 1)
+        while (
+            gpio_get_level(DHT_PIN) == 1)
         {
-            if (esp_timer_get_time() - high_start > 100)
+            if (
+                esp_timer_get_time() -
+                high_start > 100)
+            {
                 return false;
+            }
         }
 
         int64_t pulse_length =
-            esp_timer_get_time() - high_start;
+            esp_timer_get_time() -
+            high_start;
 
-        int byte_index = i / 8;
-        int bit_index = 7 - (i % 8);
+        int byte_index =
+            i / 8;
+
+        int bit_index =
+            7 - (i % 8);
 
         if (pulse_length > 40)
         {
@@ -497,14 +645,16 @@ static bool dht22_read(float *temperature, float *humidity)
     }
 
     *humidity =
-        ((data[0] << 8) | data[1]) / 10.0f;
+        ((data[0] << 8) | data[1])
+        / 10.0f;
 
     int16_t raw_temperature =
         (data[2] << 8) | data[3];
 
     if (raw_temperature & 0x8000)
     {
-        raw_temperature &= 0x7FFF;
+        raw_temperature &=
+            0x7FFF;
 
         *temperature =
             -(raw_temperature / 10.0f);
@@ -528,17 +678,20 @@ void sensorTask(void *parameter)
     TickType_t lastWakeTime =
         xTaskGetTickCount();
 
-    // ----------------------------
-    // Initialize ADC for LDR
-    // ----------------------------
+    // ----------------------------------------
+    // Initialize LDR ADC
+    // ----------------------------------------
     adc_oneshot_unit_handle_t adc_handle =
         NULL;
 
     adc_oneshot_unit_init_cfg_t init_config = {};
 
-    init_config.unit_id = ADC_UNIT_1;
+    init_config.unit_id =
+        ADC_UNIT_1;
+
     init_config.clk_src =
         ADC_RTC_CLK_SRC_DEFAULT;
+
     init_config.ulp_mode =
         ADC_ULP_MODE_DISABLE;
 
@@ -550,7 +703,10 @@ void sensorTask(void *parameter)
 
     if (result != ESP_OK)
     {
-        printf("LDR ADC initialization failed\n");
+        printf(
+            "LDR ADC initialization failed\n"
+        );
+
         vTaskDelete(NULL);
         return;
     }
@@ -580,23 +736,28 @@ void sensorTask(void *parameter)
         return;
     }
 
-    // ----------------------------
+    // ----------------------------------------
     // Periodic sensor loop
-    // ----------------------------
+    // ----------------------------------------
     while (1)
     {
-        // Read DHT22
+        // DHT22
         if (!dht22_read(
                 &sensorData.temperature,
                 &sensorData.humidity))
         {
-            printf("DHT22 reading failed\n");
+            printf(
+                "DHT22 reading failed\n"
+            );
 
-            sensorData.temperature = 0.0f;
-            sensorData.humidity = 0.0f;
+            sensorData.temperature =
+                0.0f;
+
+            sensorData.humidity =
+                0.0f;
         }
 
-        // Read LDR
+        // LDR
         int raw_value = 0;
 
         result =
@@ -608,9 +769,8 @@ void sensorTask(void *parameter)
 
         if (result == ESP_OK)
         {
-            // Documented representation:
-            // raw ADC value 0-4095
-            // converted to percentage 0-100%
+            // Convert ADC 0-4095
+            // into documented 0-100%
             sensorData.lightLevel =
                 (int)(
                     (raw_value / 4095.0f)
@@ -623,7 +783,8 @@ void sensorTask(void *parameter)
         }
 
         // Motion sensor not added yet
-        sensorData.motionDetected = false;
+        sensorData.motionDetected =
+            false;
 
         printf(
             "Temperature: %.2f C\n",
@@ -675,7 +836,6 @@ void displayTask(void *parameter)
     SensorData sensorData;
 
     oled_init();
-
     oled_clear();
 
     while (1)
@@ -687,61 +847,58 @@ void displayTask(void *parameter)
         {
             oled_clear();
 
-            // ----------------------------
-            // TEMP 24 C
-            // ----------------------------
-            oled_char(0, 0, 'T');
-            oled_char(6, 0, 'E');
-            oled_char(12, 0, 'M');
-            oled_char(18, 0, 'P');
+            // ----------------------------------------
+            // ROOM MONITOR
+            // ----------------------------------------
+            oled_char(0, 0, 'R');
+            oled_char(6, 0, 'O');
+            oled_char(12, 0, 'O');
+            oled_char(18, 0, 'M');
 
-            oled_number(
-                36,
-                0,
-                (int)sensorData.temperature
-            );
+            oled_char(30, 0, 'M');
+            oled_char(36, 0, 'O');
+            oled_char(42, 0, 'N');
+            oled_char(48, 0, 'I');
+            oled_char(54, 0, 'T');
+            oled_char(60, 0, 'O');
+            oled_char(66, 0, 'R');
 
-            oled_char(54, 0, 'C');
-
-            // ----------------------------
-            // HUM 40 %
-            // ----------------------------
-            oled_char(0, 2, 'H');
-            oled_char(6, 2, 'U');
+            // ----------------------------------------
+            // Temperature
+            // ----------------------------------------
+            oled_char(0, 2, 'T');
+            oled_char(6, 2, 'E');
             oled_char(12, 2, 'M');
+            oled_char(18, 2, 'P');
+            oled_char(24, 2, 'E');
+            oled_char(30, 2, 'R');
+            oled_char(36, 2, 'A');
+            oled_char(42, 2, 'T');
+            oled_char(48, 2, 'U');
+            oled_char(54, 2, 'R');
+            oled_char(60, 2, 'E');
 
-            oled_number(
-                30,
-                2,
-                (int)sensorData.humidity
-            );
-
-            oled_char(48, 2, '%');
-
-            // ----------------------------
-            // LIGHT 24 %
-            // ----------------------------
-            oled_char(0, 4, 'L');
-            oled_char(6, 4, 'I');
-            oled_char(12, 4, 'G');
-            oled_char(18, 4, 'H');
-            oled_char(24, 4, 'T');
-
-            oled_number(
-                42,
+            // ----------------------------------------
+            // Temperature value
+            // ----------------------------------------
+            oled_temperature(
+                0,
                 4,
-                sensorData.lightLevel
+                sensorData.temperature
             );
 
-            oled_char(60, 4, '%');
+            // C
+            oled_char(
+                36,
+                4,
+                'C'
+            );
 
             printf(
                 "DisplayTask updated OLED: "
-                "T=%.2f C, H=%.2f %%, "
-                "Light=%d %%\n",
-                sensorData.temperature,
-                sensorData.humidity,
-                sensorData.lightLevel
+                "ROOM MONITOR, "
+                "Temperature=%.2f C\n",
+                sensorData.temperature
             );
         }
     }
@@ -762,7 +919,8 @@ void alarmTask(void *parameter)
                 portMAX_DELAY) == pdPASS)
         {
             printf(
-                "AlarmTask received sensor data\n"
+                "AlarmTask received "
+                "sensor data\n"
             );
         }
     }
@@ -774,8 +932,13 @@ void alarmTask(void *parameter)
 extern "C" void app_main(void)
 {
     printf("\n");
-    printf("BCA152 FreeRTOS Multisensor\n");
-    printf("System starting...\n");
+    printf(
+        "BCA152 FreeRTOS Multisensor\n"
+    );
+
+    printf(
+        "System starting...\n"
+    );
 
     // Configure DHT22
     gpio_set_direction(
@@ -785,7 +948,9 @@ extern "C" void app_main(void)
 
     gpio_pullup_en(DHT_PIN);
 
+    // ----------------------------------------
     // Create queues
+    // ----------------------------------------
     displayQueue =
         xQueueCreate(
             5,
@@ -798,14 +963,20 @@ extern "C" void app_main(void)
             sizeof(SensorData)
         );
 
-    if (displayQueue == NULL ||
+    if (
+        displayQueue == NULL ||
         alarmQueue == NULL)
     {
-        printf("Failed to create queues\n");
+        printf(
+            "Failed to create queues\n"
+        );
+
         return;
     }
 
-    // Create SensorTask
+    // ----------------------------------------
+    // SensorTask
+    // ----------------------------------------
     xTaskCreate(
         sensorTask,
         "SensorTask",
@@ -815,7 +986,9 @@ extern "C" void app_main(void)
         NULL
     );
 
-    // Create DisplayTask
+    // ----------------------------------------
+    // DisplayTask
+    // ----------------------------------------
     xTaskCreate(
         displayTask,
         "DisplayTask",
@@ -825,7 +998,9 @@ extern "C" void app_main(void)
         NULL
     );
 
-    // Create AlarmTask
+    // ----------------------------------------
+    // AlarmTask
+    // ----------------------------------------
     xTaskCreate(
         alarmTask,
         "AlarmTask",
