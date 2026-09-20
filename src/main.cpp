@@ -22,6 +22,9 @@
 // LDR AO -> GPIO34
 #define LDR_ADC_CHANNEL ADC_CHANNEL_6
 
+// PIR OUT -> GPIO27
+#define PIR_PIN GPIO_NUM_27
+
 // OLED
 #define OLED_SDA GPIO_NUM_21
 #define OLED_SCL GPIO_NUM_22
@@ -31,6 +34,14 @@
 // Rotary Encoder
 #define ENCODER_CLK GPIO_NUM_32
 #define ENCODER_DT  GPIO_NUM_33
+
+// ============================================================
+// MOTION SETTINGS
+// ============================================================
+
+// Motion must remain inactive for this long before
+// motionDetected becomes false.
+#define MOTION_TIMEOUT_MS 15000
 
 
 // ============================================================
@@ -65,6 +76,11 @@ struct SensorData
 
 QueueHandle_t displayQueue;
 QueueHandle_t modeQueue;
+
+// Separate queue for motion state.
+// MotionTask writes to this queue.
+// DisplayTask reads from it.
+QueueHandle_t motionQueue;
 
 
 // ============================================================
@@ -854,12 +870,8 @@ void sensorTask(void *parameter)
             sensorData.lightLevel
         );
 
-        sensorData.motionDetected =
-            false;
-
-        // ====================================================
-        // TESTABLE ALARM DECISION LOGIC
-        // ====================================================
+        // Motion is NOT changed here.
+        // MotionTask is responsible for motionDetected.
 
         AlarmState alarmState =
             evaluateTemperature(
@@ -902,6 +914,96 @@ void sensorTask(void *parameter)
         vTaskDelayUntil(
             &lastWakeTime,
             pdMS_TO_TICKS(2000)
+        );
+    }
+}
+
+
+// ============================================================
+// MOTION TASK
+// ============================================================
+
+void motionTask(void *parameter)
+{
+    gpio_set_direction(
+        PIR_PIN,
+        GPIO_MODE_INPUT
+    );
+
+    bool motionDetected = false;
+
+    TickType_t lastMotionTime = 0;
+
+    printf(
+        "MotionTask: Started\n"
+    );
+
+    while (1)
+    {
+        int pirState =
+            gpio_get_level(PIR_PIN);
+
+        TickType_t now =
+            xTaskGetTickCount();
+
+        // ----------------------------------------------------
+        // NEW MOTION DETECTED
+        // ----------------------------------------------------
+
+        if (pirState == 1)
+        {
+            if (!motionDetected)
+            {
+                printf(
+                    "MotionTask: MOTION DETECTED\n"
+                );
+            }
+
+            motionDetected = true;
+
+            // Reset the inactivity timer whenever
+            // motion is detected.
+            lastMotionTime = now;
+
+            xQueueOverwrite(
+                motionQueue,
+                &motionDetected
+            );
+        }
+
+        // ----------------------------------------------------
+        // NO MOTION
+        // ----------------------------------------------------
+
+        else
+        {
+            if (motionDetected)
+            {
+                TickType_t elapsed =
+                    now - lastMotionTime;
+
+                if (
+                    elapsed >=
+                    pdMS_TO_TICKS(MOTION_TIMEOUT_MS))
+                {
+                    motionDetected = false;
+
+                    printf(
+                        "MotionTask: NO MOTION - 15 SECOND TIMEOUT\n"
+                    );
+
+                    xQueueOverwrite(
+                        motionQueue,
+                        &motionDetected
+                    );
+                }
+            }
+        }
+
+        // Check PIR frequently so the timeout
+        // can be handled accurately.
+        vTaskDelay(
+            pdMS_TO_TICKS(100)
         );
     }
 }
@@ -955,6 +1057,8 @@ void inputTask(void *parameter)
                     ENCODER_DT
                 );
 
+            // Clockwise
+
             if (currentDT == currentCLK)
             {
                 switch (currentMode)
@@ -984,6 +1088,9 @@ void inputTask(void *parameter)
                     "InputTask: clockwise\n"
                 );
             }
+
+            // Counterclockwise
+
             else
             {
                 switch (currentMode)
@@ -1180,7 +1287,10 @@ static void drawDisplay(
         }
 
         printf(
-            "DisplayTask: Motion page\n"
+            "DisplayTask: Motion page = %s\n",
+            data.motionDetected
+                ? "DETECTED"
+                : "NONE"
         );
     }
 }
@@ -1215,6 +1325,10 @@ void displayTask(void *parameter)
         bool displayChanged =
             false;
 
+        // ----------------------------------------------------
+        // DISPLAY MODE
+        // ----------------------------------------------------
+
         DisplayMode newMode;
 
         if (
@@ -1231,6 +1345,10 @@ void displayTask(void *parameter)
                 true;
         }
 
+        // ----------------------------------------------------
+        // SENSOR DATA
+        // ----------------------------------------------------
+
         SensorData newSensorData;
 
         if (
@@ -1240,12 +1358,40 @@ void displayTask(void *parameter)
                 0
             ) == pdPASS)
         {
+            // Preserve the current motion state.
+            newSensorData.motionDetected =
+                sensorData.motionDetected;
+
             sensorData =
                 newSensorData;
 
             displayChanged =
                 true;
         }
+
+        // ----------------------------------------------------
+        // MOTION DATA
+        // ----------------------------------------------------
+
+        bool newMotionState;
+
+        if (
+            xQueueReceive(
+                motionQueue,
+                &newMotionState,
+                0
+            ) == pdPASS)
+        {
+            sensorData.motionDetected =
+                newMotionState;
+
+            displayChanged =
+                true;
+        }
+
+        // ----------------------------------------------------
+        // REDRAW
+        // ----------------------------------------------------
 
         if (displayChanged)
         {
@@ -1269,6 +1415,7 @@ void displayTask(void *parameter)
 extern "C" void app_main(void)
 {
     printf("\n");
+
     printf(
         "BCA152 FreeRTOS Multisensor\n"
     );
@@ -1276,6 +1423,10 @@ extern "C" void app_main(void)
     printf(
         "System starting...\n"
     );
+
+    // --------------------------------------------------------
+    // DHT22
+    // --------------------------------------------------------
 
     gpio_set_direction(
         DHT_PIN,
@@ -1285,6 +1436,19 @@ extern "C" void app_main(void)
     gpio_pullup_en(
         DHT_PIN
     );
+
+    // --------------------------------------------------------
+    // PIR
+    // --------------------------------------------------------
+
+    gpio_set_direction(
+        PIR_PIN,
+        GPIO_MODE_INPUT
+    );
+
+    // --------------------------------------------------------
+    // QUEUES
+    // --------------------------------------------------------
 
     displayQueue =
         xQueueCreate(
@@ -1298,9 +1462,16 @@ extern "C" void app_main(void)
             sizeof(DisplayMode)
         );
 
+    motionQueue =
+        xQueueCreate(
+            1,
+            sizeof(bool)
+        );
+
     if (
         displayQueue == NULL ||
-        modeQueue == NULL)
+        modeQueue == NULL ||
+        motionQueue == NULL)
     {
         printf(
             "ERROR: Queue creation failed\n"
@@ -1309,10 +1480,23 @@ extern "C" void app_main(void)
         return;
     }
 
+    // --------------------------------------------------------
+    // TASKS
+    // --------------------------------------------------------
+
     xTaskCreate(
         sensorTask,
         "SensorTask",
         6144,
+        NULL,
+        2,
+        NULL
+    );
+
+    xTaskCreate(
+        motionTask,
+        "MotionTask",
+        4096,
         NULL,
         2,
         NULL
