@@ -11,20 +11,43 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+
 #define DHT_PIN GPIO_NUM_4
 
-// LDR
-#define LDR_ADC_CHANNEL ADC_CHANNEL_6   // GPIO34
+// LDR AO -> GPIO34
+#define LDR_ADC_CHANNEL ADC_CHANNEL_6
 
-// OLED I2C
+// OLED
 #define OLED_SDA GPIO_NUM_21
 #define OLED_SCL GPIO_NUM_22
 #define OLED_ADDR 0x3C
 #define I2C_PORT I2C_NUM_0
 
-// ----------------------------------------------------
-// Sensor Data
-// ----------------------------------------------------
+// Rotary Encoder
+#define ENCODER_CLK GPIO_NUM_32
+#define ENCODER_DT  GPIO_NUM_33
+
+
+// ============================================================
+// DISPLAY MODE
+// ============================================================
+
+enum class DisplayMode
+{
+    TEMPERATURE,
+    HUMIDITY,
+    LIGHT,
+    MOTION
+};
+
+
+// ============================================================
+// SENSOR DATA
+// ============================================================
+
 struct SensorData
 {
     float temperature;
@@ -33,15 +56,19 @@ struct SensorData
     bool motionDetected;
 };
 
-// ----------------------------------------------------
-// Queues
-// ----------------------------------------------------
-QueueHandle_t displayQueue;
-QueueHandle_t alarmQueue;
 
-// ----------------------------------------------------
-// OLED command
-// ----------------------------------------------------
+// ============================================================
+// QUEUES
+// ============================================================
+
+QueueHandle_t displayQueue;
+QueueHandle_t modeQueue;
+
+
+// ============================================================
+// OLED LOW-LEVEL FUNCTIONS
+// ============================================================
+
 static void oled_command(uint8_t command)
 {
     uint8_t data[2];
@@ -53,14 +80,12 @@ static void oled_command(uint8_t command)
         I2C_PORT,
         OLED_ADDR,
         data,
-        sizeof(data),
+        2,
         pdMS_TO_TICKS(100)
     );
 }
 
-// ----------------------------------------------------
-// OLED data
-// ----------------------------------------------------
+
 static void oled_data(
     const uint8_t *data,
     size_t length)
@@ -86,9 +111,11 @@ static void oled_data(
     );
 }
 
-// ----------------------------------------------------
-// OLED initialization
-// ----------------------------------------------------
+
+// ============================================================
+// OLED INITIALIZATION
+// ============================================================
+
 static void oled_init()
 {
     i2c_config_t config = {};
@@ -100,7 +127,10 @@ static void oled_init()
     config.scl_pullup_en = GPIO_PULLUP_ENABLE;
     config.master.clk_speed = 400000;
 
-    i2c_param_config(I2C_PORT, &config);
+    i2c_param_config(
+        I2C_PORT,
+        &config
+    );
 
     i2c_driver_install(
         I2C_PORT,
@@ -139,9 +169,11 @@ static void oled_init()
     oled_command(0xAF);
 }
 
-// ----------------------------------------------------
-// Clear OLED
-// ----------------------------------------------------
+
+// ============================================================
+// OLED CLEAR
+// ============================================================
+
 static void oled_clear()
 {
     uint8_t blank[128] = {0};
@@ -152,273 +184,296 @@ static void oled_clear()
         oled_command(0x00);
         oled_command(0x10);
 
-        oled_data(blank, 128);
+        oled_data(
+            blank,
+            128
+        );
     }
 }
 
-// ----------------------------------------------------
-// Set OLED cursor
-// ----------------------------------------------------
-static void oled_set_cursor(int x, int page)
+
+// ============================================================
+// OLED CURSOR
+// ============================================================
+
+static void oled_set_cursor(
+    int x,
+    int page)
 {
-    oled_command(0xB0 + page);
-    oled_command(0x00 + (x & 0x0F));
-    oled_command(0x10 + ((x >> 4) & 0x0F));
+    oled_command(
+        0xB0 + page
+    );
+
+    oled_command(
+        0x00 + (x & 0x0F)
+    );
+
+    oled_command(
+        0x10 + ((x >> 4) & 0x0F)
+    );
 }
 
-// ----------------------------------------------------
-// Draw one character
-// ----------------------------------------------------
+
+// ============================================================
+// FONT
+// ============================================================
+
 static void oled_char(
     int x,
     int page,
     char c)
 {
-    uint8_t pixels[6] = {
+    uint8_t p[6] =
+    {
         0, 0, 0, 0, 0, 0
     };
 
     switch (c)
     {
-        // ----------------------------
-        // Numbers
-        // ----------------------------
-        case '0':
-            pixels[0] = 0x3E;
-            pixels[1] = 0x51;
-            pixels[2] = 0x49;
-            pixels[3] = 0x45;
-            pixels[4] = 0x3E;
-            break;
-
-        case '1':
-            pixels[0] = 0x00;
-            pixels[1] = 0x42;
-            pixels[2] = 0x7F;
-            pixels[3] = 0x40;
-            pixels[4] = 0x00;
-            break;
-
-        case '2':
-            pixels[0] = 0x42;
-            pixels[1] = 0x61;
-            pixels[2] = 0x51;
-            pixels[3] = 0x49;
-            pixels[4] = 0x46;
-            break;
-
-        case '3':
-            pixels[0] = 0x21;
-            pixels[1] = 0x41;
-            pixels[2] = 0x45;
-            pixels[3] = 0x4B;
-            pixels[4] = 0x31;
-            break;
-
-        case '4':
-            pixels[0] = 0x18;
-            pixels[1] = 0x14;
-            pixels[2] = 0x12;
-            pixels[3] = 0x7F;
-            pixels[4] = 0x10;
-            break;
-
-        case '5':
-            pixels[0] = 0x27;
-            pixels[1] = 0x45;
-            pixels[2] = 0x45;
-            pixels[3] = 0x45;
-            pixels[4] = 0x39;
-            break;
-
-        case '6':
-            pixels[0] = 0x3C;
-            pixels[1] = 0x4A;
-            pixels[2] = 0x49;
-            pixels[3] = 0x49;
-            pixels[4] = 0x30;
-            break;
-
-        case '7':
-            pixels[0] = 0x01;
-            pixels[1] = 0x71;
-            pixels[2] = 0x09;
-            pixels[3] = 0x05;
-            pixels[4] = 0x03;
-            break;
-
-        case '8':
-            pixels[0] = 0x36;
-            pixels[1] = 0x49;
-            pixels[2] = 0x49;
-            pixels[3] = 0x49;
-            pixels[4] = 0x36;
-            break;
-
-        case '9':
-            pixels[0] = 0x06;
-            pixels[1] = 0x49;
-            pixels[2] = 0x49;
-            pixels[3] = 0x29;
-            pixels[4] = 0x1E;
-            break;
-
-        // ----------------------------
-        // Letters
-        // ----------------------------
         case 'A':
-            pixels[0] = 0x7E;
-            pixels[1] = 0x11;
-            pixels[2] = 0x11;
-            pixels[3] = 0x11;
-            pixels[4] = 0x7E;
+            p[0]=0x7E; p[1]=0x11; p[2]=0x11;
+            p[3]=0x11; p[4]=0x7E;
+            break;
+
+        case 'B':
+            p[0]=0x7F; p[1]=0x49; p[2]=0x49;
+            p[3]=0x49; p[4]=0x36;
             break;
 
         case 'C':
-            pixels[0] = 0x3E;
-            pixels[1] = 0x41;
-            pixels[2] = 0x41;
-            pixels[3] = 0x41;
-            pixels[4] = 0x22;
+            p[0]=0x3E; p[1]=0x41; p[2]=0x41;
+            p[3]=0x41; p[4]=0x22;
+            break;
+
+        case 'D':
+            p[0]=0x7F; p[1]=0x41; p[2]=0x41;
+            p[3]=0x22; p[4]=0x1C;
             break;
 
         case 'E':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x49;
-            pixels[2] = 0x49;
-            pixels[3] = 0x49;
-            pixels[4] = 0x41;
+            p[0]=0x7F; p[1]=0x49; p[2]=0x49;
+            p[3]=0x49; p[4]=0x41;
+            break;
+
+        case 'F':
+            p[0]=0x7F; p[1]=0x09; p[2]=0x09;
+            p[3]=0x09; p[4]=0x01;
             break;
 
         case 'G':
-            pixels[0] = 0x3E;
-            pixels[1] = 0x41;
-            pixels[2] = 0x49;
-            pixels[3] = 0x49;
-            pixels[4] = 0x7A;
+            p[0]=0x3E; p[1]=0x41; p[2]=0x49;
+            p[3]=0x49; p[4]=0x7A;
             break;
 
         case 'H':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x08;
-            pixels[2] = 0x08;
-            pixels[3] = 0x08;
-            pixels[4] = 0x7F;
+            p[0]=0x7F; p[1]=0x08; p[2]=0x08;
+            p[3]=0x08; p[4]=0x7F;
             break;
 
         case 'I':
-            pixels[0] = 0x00;
-            pixels[1] = 0x41;
-            pixels[2] = 0x7F;
-            pixels[3] = 0x41;
-            pixels[4] = 0x00;
+            p[0]=0x00; p[1]=0x41; p[2]=0x7F;
+            p[3]=0x41; p[4]=0x00;
+            break;
+
+        case 'J':
+            p[0]=0x20; p[1]=0x40; p[2]=0x41;
+            p[3]=0x3F; p[4]=0x01;
+            break;
+
+        case 'K':
+            p[0]=0x7F; p[1]=0x08; p[2]=0x14;
+            p[3]=0x22; p[4]=0x41;
             break;
 
         case 'L':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x40;
-            pixels[2] = 0x40;
-            pixels[3] = 0x40;
-            pixels[4] = 0x40;
+            p[0]=0x7F; p[1]=0x40; p[2]=0x40;
+            p[3]=0x40; p[4]=0x40;
             break;
 
         case 'M':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x02;
-            pixels[2] = 0x0C;
-            pixels[3] = 0x02;
-            pixels[4] = 0x7F;
+            p[0]=0x7F; p[1]=0x02; p[2]=0x0C;
+            p[3]=0x02; p[4]=0x7F;
             break;
 
         case 'N':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x02;
-            pixels[2] = 0x0C;
-            pixels[3] = 0x18;
-            pixels[4] = 0x7F;
+            p[0]=0x7F; p[1]=0x02; p[2]=0x0C;
+            p[3]=0x18; p[4]=0x7F;
+            break;
+
+        case 'O':
+            p[0]=0x3E; p[1]=0x41; p[2]=0x41;
+            p[3]=0x41; p[4]=0x3E;
             break;
 
         case 'P':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x09;
-            pixels[2] = 0x09;
-            pixels[3] = 0x09;
-            pixels[4] = 0x06;
+            p[0]=0x7F; p[1]=0x09; p[2]=0x09;
+            p[3]=0x09; p[4]=0x06;
+            break;
+
+        case 'Q':
+            p[0]=0x3E; p[1]=0x41; p[2]=0x51;
+            p[3]=0x21; p[4]=0x5E;
             break;
 
         case 'R':
-            pixels[0] = 0x7F;
-            pixels[1] = 0x09;
-            pixels[2] = 0x19;
-            pixels[3] = 0x29;
-            pixels[4] = 0x46;
+            p[0]=0x7F; p[1]=0x09; p[2]=0x19;
+            p[3]=0x29; p[4]=0x46;
+            break;
+
+        case 'S':
+            p[0]=0x46; p[1]=0x49; p[2]=0x49;
+            p[3]=0x49; p[4]=0x31;
             break;
 
         case 'T':
-            pixels[0] = 0x01;
-            pixels[1] = 0x01;
-            pixels[2] = 0x7F;
-            pixels[3] = 0x01;
-            pixels[4] = 0x01;
+            p[0]=0x01; p[1]=0x01; p[2]=0x7F;
+            p[3]=0x01; p[4]=0x01;
             break;
 
         case 'U':
-            pixels[0] = 0x3F;
-            pixels[1] = 0x40;
-            pixels[2] = 0x40;
-            pixels[3] = 0x40;
-            pixels[4] = 0x3F;
+            p[0]=0x3F; p[1]=0x40; p[2]=0x40;
+            p[3]=0x40; p[4]=0x3F;
             break;
 
-        // ----------------------------
-        // Symbols
-        // ----------------------------
+        case 'V':
+            p[0]=0x1F; p[1]=0x20; p[2]=0x40;
+            p[3]=0x20; p[4]=0x1F;
+            break;
+
+        case 'W':
+            p[0]=0x7F; p[1]=0x20; p[2]=0x18;
+            p[3]=0x20; p[4]=0x7F;
+            break;
+
+        case 'X':
+            p[0]=0x63; p[1]=0x14; p[2]=0x08;
+            p[3]=0x14; p[4]=0x63;
+            break;
+
+        case 'Y':
+            p[0]=0x07; p[1]=0x08; p[2]=0x70;
+            p[3]=0x08; p[4]=0x07;
+            break;
+
+        case 'Z':
+            p[0]=0x61; p[1]=0x51; p[2]=0x49;
+            p[3]=0x45; p[4]=0x43;
+            break;
+
+        case '0':
+            p[0]=0x3E; p[1]=0x51; p[2]=0x49;
+            p[3]=0x45; p[4]=0x3E;
+            break;
+
+        case '1':
+            p[0]=0x00; p[1]=0x42; p[2]=0x7F;
+            p[3]=0x40; p[4]=0x00;
+            break;
+
+        case '2':
+            p[0]=0x42; p[1]=0x61; p[2]=0x51;
+            p[3]=0x49; p[4]=0x46;
+            break;
+
+        case '3':
+            p[0]=0x21; p[1]=0x41; p[2]=0x45;
+            p[3]=0x4B; p[4]=0x31;
+            break;
+
+        case '4':
+            p[0]=0x18; p[1]=0x14; p[2]=0x12;
+            p[3]=0x7F; p[4]=0x10;
+            break;
+
+        case '5':
+            p[0]=0x27; p[1]=0x45; p[2]=0x45;
+            p[3]=0x45; p[4]=0x39;
+            break;
+
+        case '6':
+            p[0]=0x3C; p[1]=0x4A; p[2]=0x49;
+            p[3]=0x49; p[4]=0x30;
+            break;
+
+        case '7':
+            p[0]=0x01; p[1]=0x71; p[2]=0x09;
+            p[3]=0x05; p[4]=0x03;
+            break;
+
+        case '8':
+            p[0]=0x36; p[1]=0x49; p[2]=0x49;
+            p[3]=0x49; p[4]=0x36;
+            break;
+
+        case '9':
+            p[0]=0x06; p[1]=0x49; p[2]=0x49;
+            p[3]=0x29; p[4]=0x1E;
+            break;
+
         case '%':
-            pixels[0] = 0x63;
-            pixels[1] = 0x13;
-            pixels[2] = 0x08;
-            pixels[3] = 0x64;
-            pixels[4] = 0x63;
+            p[0]=0x63; p[1]=0x13; p[2]=0x08;
+            p[3]=0x64; p[4]=0x63;
             break;
 
         case '.':
-            pixels[0] = 0x00;
-            pixels[1] = 0x60;
-            pixels[2] = 0x60;
-            pixels[3] = 0x00;
-            pixels[4] = 0x00;
+            p[0]=0x00; p[1]=0x60; p[2]=0x60;
+            p[3]=0x00; p[4]=0x00;
             break;
 
-        case '-':
-            pixels[0] = 0x08;
-            pixels[1] = 0x08;
-            pixels[2] = 0x08;
-            pixels[3] = 0x08;
-            pixels[4] = 0x08;
-            break;
-
-        case ' ':
         default:
             break;
     }
 
     oled_set_cursor(x, page);
-    oled_data(pixels, 6);
+    oled_data(p, 6);
 }
 
-// ----------------------------------------------------
-// Draw integer
-// ----------------------------------------------------
+
+// ============================================================
+// OLED TEXT
+// ============================================================
+
+static void oled_text(
+    int x,
+    int page,
+    const char *text)
+{
+    while (*text)
+    {
+        oled_char(
+            x,
+            page,
+            *text
+        );
+
+        x += 6;
+        text++;
+    }
+}
+
+
+// ============================================================
+// OLED NUMBER
+// ============================================================
+
 static void oled_number(
     int x,
     int page,
     int number)
 {
     if (number < 0)
-    {
-        oled_char(x, page, '-');
         number = -number;
+
+    if (number >= 1000)
+    {
+        oled_char(
+            x,
+            page,
+            '0' + number / 1000
+        );
+
         x += 6;
+        number %= 1000;
     }
 
     if (number >= 100)
@@ -426,11 +481,11 @@ static void oled_number(
         oled_char(
             x,
             page,
-            '0' + (number / 100)
+            '0' + number / 100
         );
 
-        number %= 100;
         x += 6;
+        number %= 100;
     }
 
     if (number >= 10)
@@ -438,11 +493,11 @@ static void oled_number(
         oled_char(
             x,
             page,
-            '0' + (number / 10)
+            '0' + number / 10
         );
 
-        number %= 10;
         x += 6;
+        number %= 10;
     }
 
     oled_char(
@@ -452,33 +507,31 @@ static void oled_number(
     );
 }
 
-// ----------------------------------------------------
-// Draw one decimal temperature
-// Example: 25.4
-// ----------------------------------------------------
+
+// ============================================================
+// OLED TEMPERATURE
+// ============================================================
+
 static void oled_temperature(
     int x,
     int page,
     float temperature)
 {
-    if (temperature < 0)
-    {
-        oled_char(x, page, '-');
-        x += 6;
-        temperature = -temperature;
-    }
-
     int whole =
         (int)temperature;
 
-    int decimal =
-        (int)((temperature - whole) * 10.0f + 0.5f);
+    if (whole < 0)
+        whole = -whole;
 
-    if (decimal >= 10)
-    {
-        whole++;
-        decimal = 0;
-    }
+    int decimal =
+        (int)(
+            (temperature -
+             (int)temperature) *
+            10.0f
+        );
+
+    if (decimal < 0)
+        decimal = -decimal;
 
     oled_number(
         x,
@@ -506,14 +559,17 @@ static void oled_temperature(
     );
 }
 
-// ----------------------------------------------------
-// DHT22 reading
-// ----------------------------------------------------
+
+// ============================================================
+// DHT22 READING
+// ============================================================
+
 static bool dht22_read(
     float *temperature,
     float *humidity)
 {
-    uint8_t data[5] = {
+    uint8_t data[5] =
+    {
         0, 0, 0, 0, 0
     };
 
@@ -541,7 +597,9 @@ static bool dht22_read(
         GPIO_MODE_INPUT
     );
 
-    gpio_pullup_en(DHT_PIN);
+    gpio_pullup_en(
+        DHT_PIN
+    );
 
     int64_t start =
         esp_timer_get_time();
@@ -550,8 +608,8 @@ static bool dht22_read(
         gpio_get_level(DHT_PIN) == 1)
     {
         if (
-            esp_timer_get_time() -
-            start > 100)
+            esp_timer_get_time() - start
+            > 100)
         {
             return false;
         }
@@ -564,8 +622,8 @@ static bool dht22_read(
         gpio_get_level(DHT_PIN) == 0)
     {
         if (
-            esp_timer_get_time() -
-            start > 100)
+            esp_timer_get_time() - start
+            > 100)
         {
             return false;
         }
@@ -578,14 +636,13 @@ static bool dht22_read(
         gpio_get_level(DHT_PIN) == 1)
     {
         if (
-            esp_timer_get_time() -
-            start > 100)
+            esp_timer_get_time() - start
+            > 100)
         {
             return false;
         }
     }
 
-    // Read 40 bits
     for (int i = 0; i < 40; i++)
     {
         start =
@@ -595,8 +652,8 @@ static bool dht22_read(
             gpio_get_level(DHT_PIN) == 0)
         {
             if (
-                esp_timer_get_time() -
-                start > 100)
+                esp_timer_get_time() - start
+                > 100)
             {
                 return false;
             }
@@ -609,16 +666,16 @@ static bool dht22_read(
             gpio_get_level(DHT_PIN) == 1)
         {
             if (
-                esp_timer_get_time() -
-                high_start > 100)
+                esp_timer_get_time() - high_start
+                > 100)
             {
                 return false;
             }
         }
 
         int64_t pulse_length =
-            esp_timer_get_time() -
-            high_start;
+            esp_timer_get_time()
+            - high_start;
 
         int byte_index =
             i / 8;
@@ -640,9 +697,7 @@ static bool dht22_read(
         data[3];
 
     if (checksum != data[4])
-    {
         return false;
-    }
 
     *humidity =
         ((data[0] << 8) | data[1])
@@ -668,19 +723,24 @@ static bool dht22_read(
     return true;
 }
 
-// ----------------------------------------------------
-// SensorTask
-// ----------------------------------------------------
+
+// ============================================================
+// SENSOR TASK
+// ============================================================
+
 void sensorTask(void *parameter)
 {
-    SensorData sensorData;
+    SensorData sensorData =
+    {
+        24.0f,
+        40.0f,
+        0,
+        false
+    };
 
     TickType_t lastWakeTime =
         xTaskGetTickCount();
 
-    // ----------------------------------------
-    // Initialize LDR ADC
-    // ----------------------------------------
     adc_oneshot_unit_handle_t adc_handle =
         NULL;
 
@@ -736,28 +796,43 @@ void sensorTask(void *parameter)
         return;
     }
 
-    // ----------------------------------------
-    // Periodic sensor loop
-    // ----------------------------------------
     while (1)
     {
         // DHT22
-        if (!dht22_read(
-                &sensorData.temperature,
-                &sensorData.humidity))
+
+        float newTemperature;
+        float newHumidity;
+
+        if (
+            dht22_read(
+                &newTemperature,
+                &newHumidity))
+        {
+            sensorData.temperature =
+                newTemperature;
+
+            sensorData.humidity =
+                newHumidity;
+
+            printf(
+                "Temperature: %.2f C\n",
+                sensorData.temperature
+            );
+
+            printf(
+                "Humidity: %.2f %%\n",
+                sensorData.humidity
+            );
+        }
+        else
         {
             printf(
                 "DHT22 reading failed\n"
             );
-
-            sensorData.temperature =
-                0.0f;
-
-            sensorData.humidity =
-                0.0f;
         }
 
         // LDR
+
         int raw_value = 0;
 
         result =
@@ -769,57 +844,37 @@ void sensorTask(void *parameter)
 
         if (result == ESP_OK)
         {
-            // Convert ADC 0-4095
-            // into documented 0-100%
             sensorData.lightLevel =
                 (int)(
                     (raw_value / 4095.0f)
                     * 100.0f
                 );
         }
-        else
-        {
-            sensorData.lightLevel = 0;
-        }
-
-        // Motion sensor not added yet
-        sensorData.motionDetected =
-            false;
-
-        printf(
-            "Temperature: %.2f C\n",
-            sensorData.temperature
-        );
-
-        printf(
-            "Humidity: %.2f %%\n",
-            sensorData.humidity
-        );
 
         printf(
             "Light Level: %d %%\n",
             sensorData.lightLevel
         );
 
-        // Send to DisplayTask
+        // Motion not yet installed
+
+        sensorData.motionDetected =
+            false;
+
+        // Send data
+
         xQueueSend(
             displayQueue,
             &sensorData,
             pdMS_TO_TICKS(100)
         );
 
-        // Send to AlarmTask
-        xQueueSend(
-            alarmQueue,
-            &sensorData,
-            pdMS_TO_TICKS(100)
-        );
-
         printf(
-            "Sensor data sent to queues\n"
+            "Sensor data sent to queue\n"
         );
 
-        // Periodic execution
+        // Required periodic timing
+
         vTaskDelayUntil(
             &lastWakeTime,
             pdMS_TO_TICKS(2000)
@@ -827,108 +882,396 @@ void sensorTask(void *parameter)
     }
 }
 
-// ----------------------------------------------------
-// DisplayTask
-// OLED is owned ONLY by DisplayTask
-// ----------------------------------------------------
-void displayTask(void *parameter)
-{
-    SensorData sensorData;
 
-    oled_init();
+// ============================================================
+// INPUT TASK
+// ============================================================
+
+void inputTask(void *parameter)
+{
+    gpio_set_direction(
+        ENCODER_CLK,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_set_direction(
+        ENCODER_DT,
+        GPIO_MODE_INPUT
+    );
+
+    gpio_pullup_en(
+        ENCODER_CLK
+    );
+
+    gpio_pullup_en(
+        ENCODER_DT
+    );
+
+    DisplayMode currentMode =
+        DisplayMode::TEMPERATURE;
+
+    int lastCLK =
+        gpio_get_level(
+            ENCODER_CLK
+        );
+
+    while (1)
+    {
+        int currentCLK =
+            gpio_get_level(
+                ENCODER_CLK
+            );
+
+        if (
+            lastCLK == 1 &&
+            currentCLK == 0)
+        {
+            int currentDT =
+                gpio_get_level(
+                    ENCODER_DT
+                );
+
+            /*
+             * IMPORTANT:
+             *
+             * This condition is reversed from
+             * the previous version to match
+             * the Wokwi encoder wiring.
+             *
+             * Clockwise:
+             *
+             * Temperature
+             *      ↓
+             * Humidity
+             *      ↓
+             * Light
+             *      ↓
+             * Motion
+             *      ↓
+             * Temperature
+             */
+
+            if (currentDT == currentCLK)
+            {
+                // CLOCKWISE
+
+                switch (currentMode)
+                {
+                    case DisplayMode::TEMPERATURE:
+                        currentMode =
+                            DisplayMode::HUMIDITY;
+                        break;
+
+                    case DisplayMode::HUMIDITY:
+                        currentMode =
+                            DisplayMode::LIGHT;
+                        break;
+
+                    case DisplayMode::LIGHT:
+                        currentMode =
+                            DisplayMode::MOTION;
+                        break;
+
+                    case DisplayMode::MOTION:
+                        currentMode =
+                            DisplayMode::TEMPERATURE;
+                        break;
+                }
+
+                printf(
+                    "InputTask: clockwise\n"
+                );
+            }
+            else
+            {
+                // COUNTERCLOCKWISE
+
+                switch (currentMode)
+                {
+                    case DisplayMode::TEMPERATURE:
+                        currentMode =
+                            DisplayMode::MOTION;
+                        break;
+
+                    case DisplayMode::MOTION:
+                        currentMode =
+                            DisplayMode::LIGHT;
+                        break;
+
+                    case DisplayMode::LIGHT:
+                        currentMode =
+                            DisplayMode::HUMIDITY;
+                        break;
+
+                    case DisplayMode::HUMIDITY:
+                        currentMode =
+                            DisplayMode::TEMPERATURE;
+                        break;
+                }
+
+                printf(
+                    "InputTask: counterclockwise\n"
+                );
+            }
+
+            xQueueOverwrite(
+                modeQueue,
+                &currentMode
+            );
+
+            vTaskDelay(
+                pdMS_TO_TICKS(20)
+            );
+        }
+
+        lastCLK =
+            currentCLK;
+
+        vTaskDelay(
+            pdMS_TO_TICKS(5)
+        );
+    }
+}
+
+
+// ============================================================
+// DRAW DISPLAY
+// ============================================================
+
+static void drawDisplay(
+    DisplayMode mode,
+    const SensorData &data)
+{
     oled_clear();
 
-    while (1)
+    if (
+        mode ==
+        DisplayMode::TEMPERATURE)
     {
-        if (xQueueReceive(
-                displayQueue,
-                &sensorData,
-                portMAX_DELAY) == pdPASS)
+        oled_text(
+            0,
+            0,
+            "ROOM MONITOR"
+        );
+
+        oled_text(
+            0,
+            2,
+            "TEMPERATURE"
+        );
+
+        oled_temperature(
+            0,
+            4,
+            data.temperature
+        );
+
+        oled_char(
+            36,
+            4,
+            'C'
+        );
+
+        printf(
+            "DisplayTask: Temperature page = %.2f C\n",
+            data.temperature
+        );
+    }
+
+    else if (
+        mode ==
+        DisplayMode::HUMIDITY)
+    {
+        oled_text(
+            0,
+            0,
+            "ROOM MONITOR"
+        );
+
+        oled_text(
+            0,
+            2,
+            "HUMIDITY"
+        );
+
+        oled_number(
+            0,
+            4,
+            (int)data.humidity
+        );
+
+        oled_char(
+            24,
+            4,
+            '%'
+        );
+
+        printf(
+            "DisplayTask: Humidity page = %.2f %%\n",
+            data.humidity
+        );
+    }
+
+    else if (
+        mode ==
+        DisplayMode::LIGHT)
+    {
+        oled_text(
+            0,
+            0,
+            "ROOM MONITOR"
+        );
+
+        oled_text(
+            0,
+            2,
+            "LIGHT"
+        );
+
+        oled_number(
+            0,
+            4,
+            data.lightLevel
+        );
+
+        oled_char(
+            24,
+            4,
+            '%'
+        );
+
+        printf(
+            "DisplayTask: Light page = %d %%\n",
+            data.lightLevel
+        );
+    }
+
+    else if (
+        mode ==
+        DisplayMode::MOTION)
+    {
+        oled_text(
+            0,
+            0,
+            "ROOM MONITOR"
+        );
+
+        oled_text(
+            0,
+            2,
+            "MOTION"
+        );
+
+        if (data.motionDetected)
         {
-            oled_clear();
-
-            // ----------------------------------------
-            // ROOM MONITOR
-            // ----------------------------------------
-            oled_char(0, 0, 'R');
-            oled_char(6, 0, 'O');
-            oled_char(12, 0, 'O');
-            oled_char(18, 0, 'M');
-
-            oled_char(30, 0, 'M');
-            oled_char(36, 0, 'O');
-            oled_char(42, 0, 'N');
-            oled_char(48, 0, 'I');
-            oled_char(54, 0, 'T');
-            oled_char(60, 0, 'O');
-            oled_char(66, 0, 'R');
-
-            // ----------------------------------------
-            // Temperature
-            // ----------------------------------------
-            oled_char(0, 2, 'T');
-            oled_char(6, 2, 'E');
-            oled_char(12, 2, 'M');
-            oled_char(18, 2, 'P');
-            oled_char(24, 2, 'E');
-            oled_char(30, 2, 'R');
-            oled_char(36, 2, 'A');
-            oled_char(42, 2, 'T');
-            oled_char(48, 2, 'U');
-            oled_char(54, 2, 'R');
-            oled_char(60, 2, 'E');
-
-            // ----------------------------------------
-            // Temperature value
-            // ----------------------------------------
-            oled_temperature(
+            oled_text(
                 0,
                 4,
-                sensorData.temperature
-            );
-
-            // C
-            oled_char(
-                36,
-                4,
-                'C'
-            );
-
-            printf(
-                "DisplayTask updated OLED: "
-                "ROOM MONITOR, "
-                "Temperature=%.2f C\n",
-                sensorData.temperature
+                "DETECTED"
             );
         }
+        else
+        {
+            oled_text(
+                0,
+                4,
+                "NONE"
+            );
+        }
+
+        printf(
+            "DisplayTask: Motion page\n"
+        );
     }
 }
 
-// ----------------------------------------------------
-// AlarmTask
-// ----------------------------------------------------
-void alarmTask(void *parameter)
+
+// ============================================================
+// DISPLAY TASK
+// ============================================================
+
+void displayTask(void *parameter)
 {
-    SensorData sensorData;
+    SensorData sensorData =
+    {
+        24.0f,
+        40.0f,
+        0,
+        false
+    };
+
+    DisplayMode currentMode =
+        DisplayMode::TEMPERATURE;
+
+    oled_init();
+
+    // Show Temperature immediately
+
+    drawDisplay(
+        currentMode,
+        sensorData
+    );
 
     while (1)
     {
-        if (xQueueReceive(
-                alarmQueue,
-                &sensorData,
-                portMAX_DELAY) == pdPASS)
+        bool displayChanged =
+            false;
+
+        // Check encoder mode
+
+        DisplayMode newMode;
+
+        if (
+            xQueueReceive(
+                modeQueue,
+                &newMode,
+                0
+            ) == pdPASS)
         {
-            printf(
-                "AlarmTask received "
-                "sensor data\n"
+            currentMode =
+                newMode;
+
+            displayChanged =
+                true;
+        }
+
+        // Check sensor data
+
+        SensorData newSensorData;
+
+        if (
+            xQueueReceive(
+                displayQueue,
+                &newSensorData,
+                0
+            ) == pdPASS)
+        {
+            sensorData =
+                newSensorData;
+
+            displayChanged =
+                true;
+        }
+
+        if (displayChanged)
+        {
+            drawDisplay(
+                currentMode,
+                sensorData
             );
         }
+
+        vTaskDelay(
+            pdMS_TO_TICKS(20)
+        );
     }
 }
 
-// ----------------------------------------------------
-// Main
-// ----------------------------------------------------
+
+// ============================================================
+// MAIN
+// ============================================================
+
 extern "C" void app_main(void)
 {
     printf("\n");
@@ -940,43 +1283,44 @@ extern "C" void app_main(void)
         "System starting...\n"
     );
 
-    // Configure DHT22
+    // DHT22
+
     gpio_set_direction(
         DHT_PIN,
         GPIO_MODE_INPUT
     );
 
-    gpio_pullup_en(DHT_PIN);
+    gpio_pullup_en(
+        DHT_PIN
+    );
 
-    // ----------------------------------------
     // Create queues
-    // ----------------------------------------
+
     displayQueue =
         xQueueCreate(
             5,
             sizeof(SensorData)
         );
 
-    alarmQueue =
+    modeQueue =
         xQueueCreate(
-            5,
-            sizeof(SensorData)
+            1,
+            sizeof(DisplayMode)
         );
 
     if (
         displayQueue == NULL ||
-        alarmQueue == NULL)
+        modeQueue == NULL)
     {
         printf(
-            "Failed to create queues\n"
+            "ERROR: Queue creation failed\n"
         );
 
         return;
     }
 
-    // ----------------------------------------
     // SensorTask
-    // ----------------------------------------
+
     xTaskCreate(
         sensorTask,
         "SensorTask",
@@ -986,24 +1330,22 @@ extern "C" void app_main(void)
         NULL
     );
 
-    // ----------------------------------------
-    // DisplayTask
-    // ----------------------------------------
+    // InputTask
+
     xTaskCreate(
-        displayTask,
-        "DisplayTask",
+        inputTask,
+        "InputTask",
         4096,
         NULL,
-        1,
+        2,
         NULL
     );
 
-    // ----------------------------------------
-    // AlarmTask
-    // ----------------------------------------
+    // DisplayTask
+
     xTaskCreate(
-        alarmTask,
-        "AlarmTask",
+        displayTask,
+        "DisplayTask",
         4096,
         NULL,
         1,
