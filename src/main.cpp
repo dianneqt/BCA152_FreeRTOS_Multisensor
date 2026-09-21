@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -192,8 +195,70 @@ QueueHandle_t encoderQueue;   // +1 = clockwise, -1 = counter-clockwise
 // SYSTEM STATE
 // ====================================================
 
-volatile SystemState systemState = SystemState::ACTIVE;
-volatile bool motionDetected = false;
+// ----------------------------------------------------
+// SYSTEM EVENTS (step 35): one event group
+// ----------------------------------------------------
+//
+// Each bit has exactly ONE producer (the only task that sets or
+// clears it), which avoids write conflicts and removes the need
+// for unsynchronized global variables.
+//
+// EVENT_ACTIVE  (BIT0)  system is in the ACTIVE state
+//   Producer : MotionTask
+//   Consumers: InputTask, DisplayTask, AlarmTask
+//   Set      : at boot, and when PIR activity restores ACTIVE
+//   Cleared  : when 15 s pass without PIR activity (INACTIVE)
+//
+// EVENT_MOTION  (BIT1)  motion detected (stays set while ACTIVE)
+//   Producer : MotionTask
+//   Consumers: SensorTask (copies it into SensorData),
+//              DisplayTask (MOTION page)
+//   Set      : on the PIR rising edge
+//   Cleared  : when the 15 s inactivity timeout expires
+//              (at the same moment EVENT_ACTIVE is cleared)
+//
+// EVENT_ALARM   (BIT2)  temperature alarm is active
+//   Producer : AlarmTask
+//   Consumers: DisplayTask (shows "ALARM" on the OLED)
+//   Set      : evaluateTemperature() returns LOW or HIGH_TEMPERATURE
+//   Cleared  : temperature returns to NORMAL, or system goes INACTIVE
+//
+// The event group holds STATE. To wake DisplayTask when something
+// changes, task notifications are used (notifyDisplay()):
+//   Producers: SensorTask, MotionTask, InputTask, AlarmTask
+//   Consumer : DisplayTask   (wakes and redraws)
+// and the PIR interrupt wakes MotionTask (vTaskNotifyGiveFromISR).
+//
+// ----------------------------------------------------
+
+#define EVENT_ACTIVE (1U << 0)
+#define EVENT_MOTION (1U << 1)
+#define EVENT_ALARM  (1U << 2)
+
+EventGroupHandle_t systemEvents = NULL;
+
+static inline bool eventIsSet(EventBits_t bit)
+{
+    return (xEventGroupGetBits(systemEvents) & bit) != 0;
+}
+
+// Step 32 state machine, derived from EVENT_ACTIVE
+static inline SystemState getSystemState()
+{
+    return eventIsSet(EVENT_ACTIVE)
+        ? SystemState::ACTIVE
+        : SystemState::INACTIVE;
+}
+
+static inline bool isMotionDetected()
+{
+    return eventIsSet(EVENT_MOTION);
+}
+
+static inline bool isAlarmActive()
+{
+    return eventIsSet(EVENT_ALARM);
+}
 
 // ====================================================
 // HELPERS
@@ -208,6 +273,55 @@ static inline TickType_t ms_to_ticks(uint32_t ms)
     TickType_t ticks = pdMS_TO_TICKS(ms);
 
     return (ticks == 0) ? 1 : ticks;
+}
+
+// ----------------------------------------------------
+// SHARED RESOURCE PROTECTION (step 36): serial output
+// ----------------------------------------------------
+//
+// Resource : the serial console (UART0, used by printf)
+// Users    : every task (Sensor, Motion, Input, Display, Alarm)
+// Problem  : two tasks printing at the same time can interleave
+//            their characters, mixing two messages into one line
+// Solution : serialMutex. A task must hold it while printing.
+//
+// Use logPrint() instead of logPrint() everywhere.
+//
+// Rules:
+//  - never call logPrint() from an ISR (a mutex cannot be taken
+//    from an interrupt)
+//  - never call logPrint() inside portENTER_CRITICAL()/
+//    portEXIT_CRITICAL() (taking a mutex can block)
+//  - related lines that must stay together are printed with ONE
+//    logPrint() call (one Take/Give)
+//
+// A mutex (not a plain binary semaphore) is used because it has
+// priority inheritance: a low-priority task holding the mutex is
+// temporarily boosted so a high-priority task waiting for it is
+// not blocked indefinitely by medium-priority tasks.
+//
+// ----------------------------------------------------
+
+SemaphoreHandle_t serialMutex = NULL;
+
+static void logPrint(const char *format, ...)
+    __attribute__((format(printf, 1, 2)));
+
+static void logPrint(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    // Before the mutex exists (very early boot) just print directly
+    if (serialMutex != NULL)
+        xSemaphoreTake(serialMutex, portMAX_DELAY);
+
+    vprintf(format, args);
+
+    if (serialMutex != NULL)
+        xSemaphoreGive(serialMutex);
+
+    va_end(args);
 }
 
 // Handle of DisplayTask so other tasks can wake it instantly.
@@ -257,7 +371,7 @@ static void report_i2c_error(esp_err_t err)
     {
         i2cErrorLogged = true;
 
-        printf(
+        logPrint(
             "OLED I2C error: %s "
             "(check SDA=21, SCL=22, address 0x3C)\n",
             esp_err_to_name(err)
@@ -320,7 +434,7 @@ static void oled_init()
 
     if (err != ESP_OK)
     {
-        printf("i2c_param_config failed: %s\n", esp_err_to_name(err));
+        logPrint("i2c_param_config failed: %s\n", esp_err_to_name(err));
     }
 
     err = i2c_driver_install(
@@ -333,7 +447,7 @@ static void oled_init()
 
     if (err != ESP_OK)
     {
-        printf("i2c_driver_install failed: %s\n", esp_err_to_name(err));
+        logPrint("i2c_driver_install failed: %s\n", esp_err_to_name(err));
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -549,6 +663,11 @@ static bool dht22_read(
 
     bool success = false;
 
+    // Error text is stored here and printed AFTER the critical
+    // section ends (a mutex must not be taken inside one).
+    char errorMessage[64];
+    errorMessage[0] = '\0';
+
     portENTER_CRITICAL(&dhtMux);
 
     gpio_set_direction(
@@ -753,9 +872,11 @@ static bool dht22_read(
                     }
                     else
                     {
-                        printf(
+                        snprintf(
+                            errorMessage,
+                            sizeof(errorMessage),
                             "DHT22 invalid values: "
-                            "T=%.2f C H=%.2f %%\n",
+                            "T=%.2f C H=%.2f %%",
                             newTemperature,
                             newHumidity
                         );
@@ -763,18 +884,22 @@ static bool dht22_read(
                 }
                 else
                 {
-                    printf(
+                    snprintf(
+                        errorMessage,
+                        sizeof(errorMessage),
                         "DHT22 checksum failed "
-                        "(calc=%u received=%u)\n",
-                        checksum,
-                        data[4]
+                        "(calc=%u received=%u)",
+                        (unsigned)checksum,
+                        (unsigned)data[4]
                     );
                 }
             }
             else
             {
-                printf(
-                    "DHT22 timing/read failed\n"
+                snprintf(
+                    errorMessage,
+                    sizeof(errorMessage),
+                    "DHT22 timing/read failed"
                 );
             }
         }
@@ -785,8 +910,10 @@ static bool dht22_read(
         !(responseLow && responseHigh)
     )
     {
-        printf(
-            "DHT22 sensor response timeout\n"
+        snprintf(
+            errorMessage,
+            sizeof(errorMessage),
+            "DHT22 sensor response timeout"
         );
     }
 
@@ -798,6 +925,14 @@ static bool dht22_read(
     gpio_pullup_en(DHT_PIN);
 
     portEXIT_CRITICAL(&dhtMux);
+
+    if (errorMessage[0] != '\0')
+    {
+        logPrint(
+            "%s\n",
+            errorMessage
+        );
+    }
 
     return success;
 }
@@ -835,7 +970,7 @@ void sensorTask(void *parameter)
 
     if (result != ESP_OK)
     {
-        printf(
+        logPrint(
             "LDR ADC initialization failed: %s\n",
             esp_err_to_name(result)
         );
@@ -861,7 +996,7 @@ void sensorTask(void *parameter)
 
     if (result != ESP_OK)
     {
-        printf(
+        logPrint(
             "LDR ADC channel configuration failed: %s\n",
             esp_err_to_name(result)
         );
@@ -878,7 +1013,7 @@ void sensorTask(void *parameter)
     bool haveValidDhtReading =
         false;
 
-    printf(
+    logPrint(
         "SensorTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -915,14 +1050,14 @@ void sensorTask(void *parameter)
         {
             if (haveValidDhtReading)
             {
-                printf(
+                logPrint(
                     "DHT22 reading failed - "
                     "keeping previous valid reading\n"
                 );
             }
             else
             {
-                printf(
+                logPrint(
                     "DHT22 reading failed - "
                     "no valid reading yet\n"
                 );
@@ -966,29 +1101,22 @@ void sensorTask(void *parameter)
         // --------------------------------------------
 
         sensorData.motionDetected =
-            motionDetected;
+            isMotionDetected();
 
         // --------------------------------------------
         // SERIAL OUTPUT
         // --------------------------------------------
 
-        printf(
-            "Temperature: %.2f C\n",
-            sensorData.temperature
-        );
-
-        printf(
-            "Humidity: %.2f %%\n",
-            sensorData.humidity
-        );
-
-        printf(
-            "Light Level: %d %%\n",
-            sensorData.lightLevel
-        );
-
-        printf(
+        // One protected write: the four lines cannot be split
+        // by output from another task.
+        logPrint(
+            "Temperature: %.2f C\n"
+            "Humidity: %.2f %%\n"
+            "Light Level: %d %%\n"
             "Motion: %s\n",
+            sensorData.temperature,
+            sensorData.humidity,
+            sensorData.lightLevel,
             sensorData.motionDetected
                 ? "DETECTED"
                 : "NONE"
@@ -1008,7 +1136,7 @@ void sensorTask(void *parameter)
                 &sensorData
             );
 
-            printf(
+            logPrint(
                 "Sensor data sent to queues\n"
             );
 
@@ -1070,7 +1198,7 @@ void motionTask(void *parameter)
     bool lastPirLevel =
         false;
 
-    printf(
+    logPrint(
         "MotionTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1090,9 +1218,37 @@ void motionTask(void *parameter)
         int64_t now =
             esp_timer_get_time();
 
-        // Live PIR state (this is what the MOTION page shows).
-        motionDetected =
-            pirLevel;
+        // --------------------------------------------
+        // PIR OUTPUT CHANGED (either direction)
+        // --------------------------------------------
+
+        if (pirLevel != lastPirLevel)
+        {
+            lastPirLevel =
+                pirLevel;
+
+            if (pirLevel)
+            {
+                // Motion stays flagged until the inactivity
+                // timeout, so it is NOT cleared on the falling edge.
+                xEventGroupSetBits(
+                    systemEvents,
+                    EVENT_MOTION
+                );
+
+                logPrint(
+                    "MotionTask: MOTION DETECTED\n"
+                );
+            }
+            else
+            {
+                logPrint(
+                    "MotionTask: motion ended\n"
+                );
+            }
+
+            notifyDisplay();
+        }
 
         // --------------------------------------------
         // PIR ACTIVE: restart the inactivity timer and
@@ -1104,12 +1260,14 @@ void motionTask(void *parameter)
             lastMotionTime =
                 now;
 
-            if (systemState == SystemState::INACTIVE)
+            if (getSystemState() == SystemState::INACTIVE)
             {
-                systemState =
-                    SystemState::ACTIVE;
+                xEventGroupSetBits(
+                    systemEvents,
+                    EVENT_ACTIVE
+                );
 
-                printf(
+                logPrint(
                     "System entering ACTIVE mode\n"
                 );
 
@@ -1118,41 +1276,22 @@ void motionTask(void *parameter)
         }
 
         // --------------------------------------------
-        // PIR OUTPUT CHANGED (either direction)
-        // --------------------------------------------
-
-        if (pirLevel != lastPirLevel)
-        {
-            lastPirLevel =
-                pirLevel;
-
-            printf(
-                pirLevel
-                    ? "MotionTask: MOTION DETECTED\n"
-                    : "MotionTask: motion ended\n"
-            );
-
-            notifyDisplay();
-        }
-
-        // --------------------------------------------
         // INACTIVITY TIMEOUT
         // --------------------------------------------
 
         if (
-            systemState == SystemState::ACTIVE &&
+            getSystemState() == SystemState::ACTIVE &&
             (now - lastMotionTime) >= INACTIVITY_TIMEOUT_US
         )
         {
-            systemState =
-                SystemState::INACTIVE;
-
-            printf(
-                "MotionTask: NO MOTION - "
-                "15 SECOND TIMEOUT\n"
+            xEventGroupClearBits(
+                systemEvents,
+                EVENT_ACTIVE | EVENT_MOTION
             );
 
-            printf(
+            logPrint(
+                "MotionTask: NO MOTION - "
+                "15 SECOND TIMEOUT\n"
                 "System entering INACTIVE mode\n"
             );
 
@@ -1256,7 +1395,7 @@ void inputTask(void *parameter)
         err != ESP_ERR_INVALID_STATE
     )
     {
-        printf(
+        logPrint(
             "gpio_install_isr_service failed: %s\n",
             esp_err_to_name(err)
         );
@@ -1276,7 +1415,7 @@ void inputTask(void *parameter)
             ENCODER_SW
         );
 
-    printf(
+    logPrint(
         "InputTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1298,14 +1437,14 @@ void inputTask(void *parameter)
         )
         {
             // Encoder is only active in the ACTIVE state (step 33/34)
-            if (systemState == SystemState::ACTIVE)
+            if (getSystemState() == SystemState::ACTIVE)
             {
                 if (direction > 0)
                 {
                     currentMode =
                         nextMode(currentMode);
 
-                    printf(
+                    logPrint(
                         "InputTask: clockwise -> %s\n",
                         modeToString(currentMode)
                     );
@@ -1315,7 +1454,7 @@ void inputTask(void *parameter)
                     currentMode =
                         previousMode(currentMode);
 
-                    printf(
+                    logPrint(
                         "InputTask: counter-clockwise -> %s\n",
                         modeToString(currentMode)
                     );
@@ -1342,7 +1481,7 @@ void inputTask(void *parameter)
         if (
             lastButton == 1 &&
             currentButton == 0 &&
-            systemState == SystemState::ACTIVE
+            getSystemState() == SystemState::ACTIVE
         )
         {
             currentMode =
@@ -1355,7 +1494,7 @@ void inputTask(void *parameter)
 
             notifyDisplay();
 
-            printf(
+            logPrint(
                 "InputTask: button pressed -> %s\n",
                 modeToString(currentMode)
             );
@@ -1397,6 +1536,16 @@ static void drawPage(
         "ROOM MONITOR"
     );
 
+    // EVENT_ALARM: show a small alarm marker on every page
+    if (isAlarmActive())
+    {
+        oled_text(
+            90,
+            0,
+            "ALARM"
+        );
+    }
+
     switch (mode)
     {
         case DisplayMode::TEMPERATURE:
@@ -1412,7 +1561,7 @@ static void drawPage(
 
             oled_text_big(0, 5, line);
 
-            printf(
+            logPrint(
                 "DisplayTask: "
                 "Temperature page = %.2f C\n",
                 data.temperature
@@ -1433,7 +1582,7 @@ static void drawPage(
 
             oled_text_big(0, 5, line);
 
-            printf(
+            logPrint(
                 "DisplayTask: "
                 "Humidity page = %.2f %%\n",
                 data.humidity
@@ -1454,7 +1603,7 @@ static void drawPage(
 
             oled_text_big(0, 5, line);
 
-            printf(
+            logPrint(
                 "DisplayTask: "
                 "Light page = %d %%\n",
                 data.lightLevel
@@ -1469,14 +1618,14 @@ static void drawPage(
             oled_text_big(
                 0,
                 5,
-                motionDetected
+                isMotionDetected()
                     ? "DETECTED"
                     : "NONE"
             );
 
-            printf(
+            logPrint(
                 "DisplayTask: Motion page = %s\n",
-                motionDetected
+                isMotionDetected()
                     ? "DETECTED"
                     : "NONE"
             );
@@ -1508,12 +1657,13 @@ void displayTask(void *parameter)
     bool displayOn = true;
     bool needRedraw = true;
     bool lastMotionShown = false;
+    bool lastAlarmShown = false;
 
     oled_init();
     oled_clear();
     oled_flush();
 
-    printf(
+    logPrint(
         "DisplayTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1564,7 +1714,7 @@ void displayTask(void *parameter)
         // INACTIVE: blank the OLED once, then do nothing
         // --------------------------------------------
 
-        if (systemState != SystemState::ACTIVE)
+        if (getSystemState() != SystemState::ACTIVE)
         {
             if (displayOn)
             {
@@ -1573,7 +1723,7 @@ void displayTask(void *parameter)
                 oled_power(false);
                 displayOn = false;
 
-                printf(
+                logPrint(
                     "DisplayTask: OLED OFF - "
                     "system INACTIVE\n"
                 );
@@ -1592,17 +1742,21 @@ void displayTask(void *parameter)
             displayOn = true;
             needRedraw = true;
 
-            printf(
+            logPrint(
                 "DisplayTask: OLED ON - "
                 "system ACTIVE\n"
             );
         }
 
-        // Redraw immediately when the motion state changes
-        // while the motion page is showing.
+        // Redraw when EVENT_ALARM changes, or when EVENT_MOTION
+        // changes while the motion page is showing.
+        bool motionNow = isMotionDetected();
+        bool alarmNow = isAlarmActive();
+
         if (
-            currentMode == DisplayMode::MOTION &&
-            motionDetected != lastMotionShown
+            (currentMode == DisplayMode::MOTION &&
+             motionNow != lastMotionShown) ||
+            alarmNow != lastAlarmShown
         )
         {
             needRedraw = true;
@@ -1612,7 +1766,8 @@ void displayTask(void *parameter)
             continue;
 
         needRedraw = false;
-        lastMotionShown = motionDetected;
+        lastMotionShown = motionNow;
+        lastAlarmShown = alarmNow;
 
         drawPage(
             currentMode,
@@ -1643,7 +1798,7 @@ void alarmTask(void *parameter)
 
     bool firstEvaluation = true;
 
-    printf(
+    logPrint(
         "AlarmTask: Started on CPU %d\n",
         xPortGetCoreID()
     );
@@ -1659,8 +1814,24 @@ void alarmTask(void *parameter)
         )
         {
             // Alarm is only active in ACTIVE state (step 33/34)
-            if (systemState != SystemState::ACTIVE)
+            if (getSystemState() != SystemState::ACTIVE)
             {
+                if (isAlarmActive())
+                {
+                    xEventGroupClearBits(
+                        systemEvents,
+                        EVENT_ALARM
+                    );
+
+                    logPrint(
+                        "Alarm cleared - system INACTIVE\n"
+                    );
+                }
+
+                logPrint(
+                    "Status: INACTIVE | Alarm: OFF\n"
+                );
+
                 firstEvaluation = true;
 
                 continue;
@@ -1673,20 +1844,94 @@ void alarmTask(void *parameter)
 
             if (firstEvaluation || state != lastState)
             {
-                printf(
+                logPrint(
                     "Alarm State: %s (%.1f C)\n",
                     alarmStateToString(state),
                     sensorData.temperature
                 );
 
+                // Publish the result as an event
+                if (state == AlarmState::NORMAL)
+                {
+                    xEventGroupClearBits(
+                        systemEvents,
+                        EVENT_ALARM
+                    );
+                }
+                else
+                {
+                    xEventGroupSetBits(
+                        systemEvents,
+                        EVENT_ALARM
+                    );
+                }
+
                 // Hardware hook: drive the buzzer here based on 'state'.
+
+                notifyDisplay();
 
                 lastState = state;
                 firstEvaluation = false;
             }
+
+            // One status line per sample so the state is always visible
+            logPrint(
+                "Status: ACTIVE | Alarm: %s\n",
+                alarmStateToString(state)
+            );
         }
     }
 }
+
+// ====================================================
+// SERIAL MUTEX TEST (step 36) - proves the mutex works
+// ====================================================
+//
+// Two extra tasks print one message in several separate pieces,
+// on different CPU cores, at the same time.
+//
+//   SERIAL_MUTEX_TEST 0  -> normal program (test tasks not created)
+//   SERIAL_MUTEX_TEST 1  -> start the two test tasks
+//
+//   SERIAL_MUTEX_TEST_USE_MUTEX 0 -> NO protection: the pieces of
+//        message [A] and [B] get mixed together in the log
+//   SERIAL_MUTEX_TEST_USE_MUTEX 1 -> mutex held for the whole
+//        message: every message comes out complete
+//
+// Set SERIAL_MUTEX_TEST back to 0 when you are done testing.
+//
+// ====================================================
+
+#define SERIAL_MUTEX_TEST 0
+#define SERIAL_MUTEX_TEST_USE_MUTEX 0
+
+#if SERIAL_MUTEX_TEST
+
+static void serialTestTask(void *parameter)
+{
+    const char *name = (const char *)parameter;
+
+    while (1)
+    {
+#if SERIAL_MUTEX_TEST_USE_MUTEX
+        xSemaphoreTake(serialMutex, portMAX_DELAY);
+#endif
+
+        // One message written in four separate pieces
+        printf("[%s] one, ", name);
+        printf("two, ");
+        printf("three, ");
+        printf("four\n");
+
+#if SERIAL_MUTEX_TEST_USE_MUTEX
+        xSemaphoreGive(serialMutex);
+#endif
+
+        vTaskDelay(ms_to_ticks(10));
+    }
+}
+
+#endif
 
 // ====================================================
 // MAIN
@@ -1694,21 +1939,25 @@ void alarmTask(void *parameter)
 
 extern "C" void app_main(void)
 {
-    printf("\n");
+    // Create the serial mutex before anything prints
+    serialMutex =
+        xSemaphoreCreateMutex();
 
-    printf(
+    logPrint("\n");
+
+    logPrint(
         "====================================\n"
     );
 
-    printf(
+    logPrint(
         "BCA152 FreeRTOS Multisensor\n"
     );
 
-    printf(
+    logPrint(
         "System starting...\n"
     );
 
-    printf(
+    logPrint(
         "====================================\n"
     );
 
@@ -1750,7 +1999,7 @@ extern "C" void app_main(void)
         isrResult != ESP_ERR_INVALID_STATE
     )
     {
-        printf(
+        logPrint(
             "gpio_install_isr_service failed: %s\n",
             esp_err_to_name(isrResult)
         );
@@ -1784,22 +2033,32 @@ extern "C" void app_main(void)
             sizeof(int8_t)
         );
 
+    systemEvents =
+        xEventGroupCreate();
+
     if (
         displayQueue == NULL ||
         alarmQueue == NULL ||
         modeQueue == NULL ||
-        encoderQueue == NULL
+        encoderQueue == NULL ||
+        systemEvents == NULL
     )
     {
-        printf(
+        logPrint(
             "ERROR: Failed to create queues\n"
         );
 
         return;
     }
 
-    printf(
-        "Queues created successfully.\n"
+    logPrint(
+        "Queues and event group created successfully.\n"
+    );
+
+    // The system starts in the ACTIVE state
+    xEventGroupSetBits(
+        systemEvents,
+        EVENT_ACTIVE
     );
 
     // --------------------------------------------
@@ -1836,7 +2095,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        logPrint(
             "ERROR: SensorTask creation failed\n"
         );
 
@@ -1860,7 +2119,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        logPrint(
             "ERROR: MotionTask creation failed\n"
         );
 
@@ -1884,7 +2143,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        logPrint(
             "ERROR: InputTask creation failed\n"
         );
 
@@ -1908,7 +2167,7 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        logPrint(
             "ERROR: DisplayTask creation failed\n"
         );
 
@@ -1932,14 +2191,20 @@ extern "C" void app_main(void)
 
     if (result != pdPASS)
     {
-        printf(
+        logPrint(
             "ERROR: AlarmTask creation failed\n"
         );
 
         return;
     }
 
-    printf(
+#if SERIAL_MUTEX_TEST
+    // Test tasks on different cores so they really run in parallel
+    xTaskCreatePinnedToCore(serialTestTask, "SerialTestA", 3072, (void *)"A", 3, NULL, 0);
+    xTaskCreatePinnedToCore(serialTestTask, "SerialTestB", 3072, (void *)"B", 3, NULL, 1);
+#endif
+
+    logPrint(
         "All tasks started successfully.\n"
     );
 }
