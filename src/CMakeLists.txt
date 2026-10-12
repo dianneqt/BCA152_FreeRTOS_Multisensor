@@ -1,6 +1,15 @@
-# This file was automatically generated for projects
-# without default 'CMakeLists.txt' file.
-
-FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
-
-idf_component_register(SRCS ${app_sources})
+idf_component_register(
+    SRCS
+        "main.cpp"
+        "rtos_objects.cpp"
+        "system_state.cpp"
+        "display_mode.cpp"
+        "alarm_logic.cpp"
+        "state_logic.cpp"
+        "sensors.cpp"
+        "display.cpp"
+        "input.cpp"
+        "motion.cpp"
+        "alarm.cpp"
+    INCLUDE_DIRS "." "../include"
+)
